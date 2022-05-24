@@ -15,11 +15,5 @@ First you need to select category type and searching text (by search() function 
 ```
 category list: 'stock' | 'futures' | 'forex' | 'cfd' | 'crypto' | 'index' | 'economic'
 ```
-# Example
-```python
-data = search('btcusdt', 'crypto')
-```
-
-if there is any results it will be shown.
 
 
