@@ -1,91 +1,160 @@
+#!/usr/bin/env python3
+"""
+tradingview_client.py
+
+Cliente para consumir ticks de preço em tempo real via WebSocket
+do TradingView. Usa Lógica de sessão, assinatura de símbolos,
+parsing de mensagens e auto-reconnect com backoff.
+"""
+
+import argparse
 import json
+import logging
 import random
-import re
+import string
+import sys
+import time
+from typing import Any, Dict, Optional
+
 import requests
-from websocket import create_connection
+from websocket import WebSocketApp, WebSocketConnectionClosedException
 
-tradingViewSocket = 'wss://data.tradingview.com/socket.io/websocket'
+# --- Configuração de logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-def pesquisar(query, categoria):
-    res = requests.get(f'https://symbol-search.tradingview.com/symbol_search/?text={query}&type={categoria}')
-    if res.status_code == 200:
-        res = res.json()
-        if len(res) == 0:
-            print('Nenhuma moeda encontrada.')
-            return False    
-        else:
-            return res[0]
-    else:
-        print('Erro de rede.')
+# --- Constantes ---
+SEARCH_URL = "https://symbol-search.tradingview.com/symbol_search/"
+WS_URL = "wss://data.tradingview.com/socket.io/websocket"
 
-def gerar_sessao():
-    tamanho_string = 12
-    letras = string.ascii_lowercase
-    string_aleatoria =  ''.join(random.choice(letras) for i in range(tamanho_string))
-    return "qs_" + string_aleatoria
+PING_INTERVAL = 20  # segundos
+BACKOFF_MAX = 300   # limite de backoff exponencial
 
-def adicionar_cabecalho(st):
-    return "~m~" + str(len(st)) + "~m~" + st
 
-def construir_mensagem(func, lista_parametros):
-    return json.dumps({
-        "m": func,
-        "p": lista_parametros
-        }, separators=(',', ':'))
+class TradingViewClient:
+    """Cliente WebSocket para streaming de dados do TradingView."""
 
-def criar_mensagem(func, lista_parametros):
-    return adicionar_cabecalho(construir_mensagem(func, lista_parametros))
+    def __init__(self, symbol: str, category: str):
+        """
+        :param symbol: texto de pesquisa do símbolo (ex: 'BTCUSD').
+        :param category: 'stock', 'forex', 'crypto', etc.
+        """
+        self.symbol = symbol
+        self.category = category
+        self.session_id = self._generate_session_id()
+        self.ws: Optional[WebSocketApp] = None
 
-def enviar_mensagem(ws, func, args):
-    ws.send(criar_mensagem(func, args))
+    @staticmethod
+    def _generate_session_id(length: int = 12) -> str:
+        chars = string.ascii_lowercase
+        return "qs_" + "".join(random.choice(chars) for _ in range(length))
 
-headers = json.dumps({
-    'Origin': 'https://data.tradingview.com'
-})
+    def _search_symbol(self) -> Dict[str, Any]:
+        """Faz search na API REST para obter o símbolo completo."""
+        params = {"text": self.symbol, "type": self.category}
+        resp = requests.get(SEARCH_URL, params=params, timeout=5)
+        resp.raise_for_status()
+        results = resp.json()
+        if not results:
+            raise ValueError("Nenhum símbolo encontrado para "
+                             f"'{self.symbol}' em '{self.category}'")
+        return results[0]
+
+    @staticmethod
+    def _wrap_message(func: str, params: list) -> str:
+        """Empacota JSON com header ~m~<len>~m~JSON."""
+        payload = json.dumps({"m": func, "p": params}, separators=(",", ":"))
+        return f"~m~{len(payload)}~m~{payload}"
+
+    def on_message(self, ws, raw_msg: str):
+        """Callback para cada mensagem recebida."""
+        # descarta mensagens de handhake/ping padrão
+        if raw_msg.startswith("~h~") or raw_msg.strip() == "":
+            return
+
+        # extrai JSON depois do segundo "~m~"
+        parts = raw_msg.split("~m~")
+        if len(parts) < 3:
+            return
+        try:
+            data = json.loads(parts[2])
+        except json.JSONDecodeError:
+            logger.debug("Falha ao decodificar JSON: %s", parts[2])
+            return
+
+        # evento de preço
+        if data.get("m") == "qsd":
+            # data['p'] = [session, {"n": symbol, "v": {"lp": last_price}}]
+            symbol = data["p"][1]["n"]
+            price = data["p"][1]["v"]["lp"]
+            logger.info(f"{symbol} -> {price}")
+
+    def on_error(self, ws, error):
+        logger.error("WebSocket error: %s", error)
+
+    def on_close(self, ws, close_status_code, close_msg):
+        logger.warning("WebSocket closed (%s): %s", close_status_code, close_msg)
+
+    def on_open(self, ws):
+        """Callback de abertura: registra sessão e símbolos."""
+        logger.info("WebSocket aberto, session_id=%s", self.session_id)
+        send = lambda f, p: ws.send(self._wrap_message(f, p))
+
+        send("quote_create_session", [self.session_id])
+        send("quote_set_fields", [self.session_id, "lp"])
+        # símbolo no formato EXCHANGE:SYMBOL
+        meta = self._search_symbol()
+        full_sym = f"{meta['exchange'].upper()}:{meta['symbol'].upper()}"
+        send("quote_add_symbols", [self.session_id, full_sym])
+
+    def run(self):
+        """Inicia o loop de conexão com auto-reconnect."""
+        backoff = 1
+        while True:
+            try:
+                self.ws = WebSocketApp(
+                    WS_URL,
+                    on_open=self.on_open,
+                    on_message=self.on_message,
+                    on_error=self.on_error,
+                    on_close=self.on_close,
+                    header={"Origin": "https://data.tradingview.com"},
+                    ping_interval=PING_INTERVAL,
+                    ping_timeout=10
+                )
+                self.ws.run_forever()
+            except WebSocketConnectionClosedException:
+                logger.warning("Conexão fechada, reconectando em %s s...", backoff)
+            except Exception as e:
+                logger.exception("Erro inesperado, reconectando em %s s...", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, BACKOFF_MAX)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Consome preço em tempo real do TradingView via WebSocket"
+    )
+    p.add_argument("symbol", help="Texto de busca do símbolo (ex: BTCUSD)")
+    p.add_argument(
+        "-c", "--category", default="crypto",
+        choices=["stock", "forex", "crypto", "futures", "cfd", "index", "economic"]
+    )
+    return p.parse_args()
+
 
 def main():
-    moeda = input('Moeda: ') 
-    categoria = input('Categoria: ') # Categorias: 'stock', 'futures', 'forex', 'cfd', 'crypto', 'index', 'economic'
-    dados = pesquisar(moeda, categoria)
+    args = parse_args()
+    client = TradingViewClient(args.symbol, args.category)
+    try:
+        client.run()
+    except KeyboardInterrupt:
+        logger.info("Encerrando por keyboard interrupt")
+        sys.exit(0)
 
-    if not dados:
-        exit()
-        
-    nome_simbolo = dados['symbol']
-    corretora = dados['exchange']
-    id_simbolo = f'{corretora.upper()}:{nome_simbolo.upper()}'
-        
-    print(id_simbolo, end='\n\n')
-    
-    # criar túnel
-    ws = create_connection(tradingViewSocket, headers=headers)
-    sessao = gerar_sessao()
 
-    enviar_mensagem(ws, "quote_create_session", [sessao])
-    enviar_mensagem(ws, "quote_set_fields", [sessao, 'lp'])
-    enviar_mensagem(ws, "quote_add_symbols", [sessao, id_simbolo])
-
-    while True:
-        try:
-            resultado = ws.recv()
-            if 'quote_completed' in resultado or 'session_id' in resultado:
-                continue
-            res = re.findall("^.*?({.*)$", resultado)
-            if len(res) != 0:
-                json_res = json.loads(res[0])
-                if json_res['m'] == 'qsd':
-                    simbolo = json_res['p'][1]['n']
-                    preco = json_res['p'][1]['v']['lp']
-                    print(f'{simbolo} -> {preco}')
-            else:
-                # pacote de ping
-                ping_str = re.findall(".......(.*)", resultado)
-                if len(ping_str) != 0:
-                    ping_str = ping_str[0]
-                    ws.send("~m~" + str(len(ping_str)) + "~m~" + ping_str)
-        except Exception as e:
-            continue
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
